@@ -11,7 +11,7 @@
 #include <errno.h>
 
 static ev_io io_tun, io_udp;
-static char buffer[16 * 1024];
+static char buffer[64 * 1024];
 
 static void on_tun_callback(EV_P_ ev_io *w, int revents) {
     ssize_t n;

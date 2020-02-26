@@ -7,5 +7,5 @@ add_definitions(-D_GNU_SOURCE)
 add_executable(simple_tun tun.c)
 target_link_libraries(simple_tun PUBLIC ev)
 
-add_executable(udp_forward udp_forward.c)
-target_link_libraries(udp_forward PUBLIC ev)
+add_executable(udp_relay udp_relay.c)
+target_link_libraries(udp_relay PUBLIC ev)

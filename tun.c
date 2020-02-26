@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include <sys/fcntl.h>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
 #include <linux/if.h>
 #include <linux/if_tun.h>
 #include <ev.h>
@@ -41,7 +42,7 @@ static void on_udp_callback(EV_P_ ev_io *w, int revents) {
     write(io_tun.fd, buffer, n);
 }
 
-static void tun_start(void) {
+static void tun_start(int is_tun) {
     struct ifreq ifr;
     int fd, err;
 
@@ -57,7 +58,7 @@ static void tun_start(void) {
      *
      *        IFF_NO_PI - Do not provide packet information
      */
-    ifr.ifr_flags = IFF_TUN | IFF_NO_PI;
+    ifr.ifr_flags = (is_tun ? IFF_TUN : IFF_TAP) | IFF_NO_PI;
 
     if ((err = ioctl(fd, TUNSETIFF, (void *) &ifr)) < 0) {
         close(fd);
@@ -100,10 +101,11 @@ static void udp_start(int listen_mode, const char *addr, const char *port) {
 }
 
 static void usage(const char *prog_name) {
-    fprintf(stderr, "Usage: %s [-l] addr port\n"
+    fprintf(stderr, "Usage: %s [-lu] addr port\n"
                     "\n"
                     "Options:\n"
                     "   -l   Listen mode. (The default is connect mode)\n"
+                    "   -u   TUN device. (The default is TAP device)\n"
                     "\n"
                     "  addr  The local address in listen mode or the remote address in connect mode.\n"
                     "  port  The bind port in listen mode or the remote port in connect mode.\n"
@@ -116,11 +118,15 @@ static void usage(const char *prog_name) {
 int main(int argc, char *argv[]) {
     int opt;
     int listen_mode = 0;
+    int is_tun = 0;
     const char *addr, *port;
-    while ((opt = getopt(argc, argv, "l")) != -1) {
+    while ((opt = getopt(argc, argv, "lu")) != -1) {
         switch (opt) {
             case 'l':
                 listen_mode = 1;
+                break;
+            case 'u':
+                is_tun = 1;
                 break;
             default: /* '?' */
                 usage(argv[0]);
@@ -132,7 +138,7 @@ int main(int argc, char *argv[]) {
     addr = argv[optind];
     port = argv[optind + 1];
 
-    tun_start();
+    tun_start(is_tun);
     udp_start(listen_mode, addr, port);
     ev_run(EV_DEFAULT_ 0);
     return 0;

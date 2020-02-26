@@ -1,6 +1,10 @@
 # Simple TUN/TAP Tunnel
 Create a simple tun/tap tunnel on linux system to share network.
 
+# Requirement
+* [libev](http://software.schmorp.de/pkg/libev.html)
+* [mbedcrypto](https://github.com/ARMmbed/mbed-crypto)
+
 # Build
 ```bash
 mkdir build

@@ -88,7 +88,7 @@ static int crypto_decrypt(
                                   in_tag, 4,
                                   in_ciphertext, out_buf);
     if (rc != 0) {
-        mbedtls_fail("mbedtls_gcm_crypt_and_tag", rc);
+        return rc;
     }
     *olen = in_tag - in_ciphertext;
     return rc;
@@ -116,9 +116,16 @@ static void on_udp_callback(EV_P_ ev_io *w, int revents) {
 
     n = recv(io_udp.fd, buffer_ciphertext, sizeof(buffer_ciphertext), MSG_DONTWAIT);
     if (n < 0) {
-        if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
-            perror("udp: recv");
-            exit(1);
+        switch (errno) {
+            case EMSGSIZE:
+                fprintf(stderr, "udp: message too large. Decrease your MTU on the tap/tun interface.\n");
+                break;
+            case EINTR:
+            case EAGAIN:
+                break;
+            default:
+                perror("udp: recv");
+                exit(1);
         }
         return;
     }

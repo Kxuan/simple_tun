@@ -23,6 +23,8 @@ static uint8_t buffer_plaintext[64 * 1024], buffer_ciphertext[64 * 1024 + 16];
 static mbedtls_gcm_context aes_gcm;
 static mbedtls_entropy_context entropy;
 static mbedtls_ctr_drbg_context ctr_drbg;
+static struct sockaddr_storage peer_addr;
+static socklen_t peer_addrlen = 0;
 
 static void mbedtls_fail(const char *func, int rc) {
     char buf[100];
@@ -97,6 +99,9 @@ static int crypto_decrypt(
 static void on_tun_callback(EV_P_ ev_io *w, int revents) {
     ssize_t n;
 
+    if (peer_addrlen == 0) {
+        return;
+    }
     n = read(io_tun.fd, buffer_plaintext, sizeof(buffer_plaintext));
     if (n < 0) {
         if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
@@ -108,13 +113,17 @@ static void on_tun_callback(EV_P_ ev_io *w, int revents) {
     size_t new_len;
     crypto_encrypt(buffer_ciphertext, &new_len, buffer_plaintext, n);
 
-    send(io_udp.fd, buffer_ciphertext, new_len, MSG_DONTWAIT | MSG_NOSIGNAL);
+    sendto(io_udp.fd, buffer_ciphertext, new_len, MSG_DONTWAIT | MSG_NOSIGNAL,
+           (struct sockaddr *) &peer_addr, peer_addrlen);
 }
 
 static void on_udp_callback(EV_P_ ev_io *w, int revents) {
     ssize_t n;
+    struct sockaddr_storage addr;
+    socklen_t addrlen = sizeof(&addr);
 
-    n = recv(io_udp.fd, buffer_ciphertext, sizeof(buffer_ciphertext), MSG_DONTWAIT);
+    n = recvfrom(io_udp.fd, buffer_ciphertext, sizeof(buffer_ciphertext), MSG_DONTWAIT,
+                 (struct sockaddr *) &addr, &addrlen);
     if (n < 0) {
         switch (errno) {
             case EMSGSIZE:
@@ -134,7 +143,11 @@ static void on_udp_callback(EV_P_ ev_io *w, int revents) {
     if (rc != 0) {
         return;
     }
-
+    if (peer_addrlen == 0) {
+        peer_addrlen = addrlen;
+        memcpy(&peer_addr, &addr, addrlen);
+        fprintf(stderr, "Peer incoming\n");
+    }
     write(io_tun.fd, buffer_plaintext, new_len);
 }
 
@@ -185,12 +198,13 @@ static void udp_start(int listen_mode, const char *addr, const char *port) {
     }
     if (listen_mode) {
         rc = bind(fd, ai->ai_addr, ai->ai_addrlen);
+        if (rc < 0) {
+            perror(listen_mode ? "bind" : "connect");
+            exit(1);
+        }
     } else {
-        rc = connect(fd, ai->ai_addr, ai->ai_addrlen);
-    }
-    if (rc < 0) {
-        perror(listen_mode ? "bind" : "connect");
-        exit(1);
+        peer_addrlen = ai->ai_addrlen;
+        memcpy(&peer_addr, ai->ai_addr, ai->ai_addrlen);
     }
     ev_io_init(&io_udp, on_udp_callback, fd, EV_READ);
     ev_io_start(EV_DEFAULT_ &io_udp);

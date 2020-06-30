@@ -141,7 +141,7 @@ static void on_udp_callback(EV_P_ ev_io *w, int revents) {
         return;
     }
     size_t new_len;
-    int rc = crypto_decrypt(buffer_plaintext + 1, &new_len, buffer_ciphertext, n - 1);
+    int rc = crypto_decrypt(buffer_plaintext, &new_len, buffer_ciphertext + 1, n - 1);
     if (rc != 0) {
         return;
     }
@@ -150,7 +150,7 @@ static void on_udp_callback(EV_P_ ev_io *w, int revents) {
         memcpy(&peer_addr, &addr, addrlen);
         fprintf(stderr, "Peer incoming\n");
     }
-    write(io_tun.fd, buffer_plaintext + 1, new_len);
+    write(io_tun.fd, buffer_plaintext, new_len);
 }
 
 static void tun_start(int is_tun) {

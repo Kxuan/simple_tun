@@ -58,7 +58,7 @@ static void on_udp_callback(EV_P_ ev_io *w, int revents) {
             getnameinfo((const struct sockaddr *) &addr, addrlen,
                         name, sizeof(name),
                         port, sizeof(port), NI_NUMERICHOST);
-            fprintf(stderr, "Update client-%c address to %s:%s", s->id, name, port);
+            fprintf(stderr, "Update client-%c address to %s:%s\n", s->id, name, port);
             s->addrlen = addrlen;
             memcpy(&s->addr, &addr, addrlen);
         }

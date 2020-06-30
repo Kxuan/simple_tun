@@ -17,7 +17,7 @@ struct client {
 };
 struct client all_clients[2] = {
         {.id = '0'},
-        {.id = '0'},
+        {.id = '1'},
 };
 static char buffer[64 * 1024];
 

@@ -10,21 +10,28 @@
 #include <errno.h>
 
 static ev_io io_udp;
-static struct sockaddr_storage addr1, addr2;
-static socklen_t addr1len, addr2len;
+struct client {
+    uint8_t id;
+    struct sockaddr_storage addr;
+    socklen_t addrlen;
+};
+struct client all_clients[2] = {
+        {.id = '0'},
+        {.id = '1'},
+};
 static char buffer[64 * 1024];
 
 static void on_udp_callback(EV_P_ ev_io *w, int revents) {
     ssize_t n;
-    struct sockaddr_storage src_addr;
-    socklen_t src_addrlen, dst_addrlen;
-    struct sockaddr *dst_addr;
+    struct sockaddr_storage addr;
+    socklen_t addrlen;
+    struct client *s, *d;
 
     while (1) {
-        src_addrlen = sizeof(src_addr);
+        addrlen = sizeof(addr);
         n = recvfrom(io_udp.fd, buffer, sizeof(buffer), MSG_DONTWAIT,
-                     (struct sockaddr *) &src_addr, &src_addrlen);
-        if (n < 0) {
+                     (struct sockaddr *) &addr, &addrlen);
+        if (n < 1) {
             if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
                 perror("udp: recv");
                 exit(1);
@@ -32,17 +39,36 @@ static void on_udp_callback(EV_P_ ev_io *w, int revents) {
             return;
         }
 
-        if (src_addrlen == addr1len && memcmp(&src_addr, &addr1, addr1len) == 0) {
-            dst_addr = (struct sockaddr *) &addr2;
-            dst_addrlen = addr2len;
-        } else if (src_addrlen == addr2len && memcmp(&src_addr, &addr2, addr2len) == 0) {
-            dst_addr = (struct sockaddr *) &addr1;
-            dst_addrlen = addr1len;
-        } else {
-            return;
+        switch (buffer[0]) {
+            case '0':
+                s = all_clients + 0;
+                d = all_clients + 1;
+                break;
+            case '1':
+                s = all_clients + 1;
+                d = all_clients + 0;
+                break;
+            default:
+                fprintf(stderr, "Unexpected client identifier: %02x\n", (int) buffer[0]);
+                continue;
         }
 
-        sendto(io_udp.fd, buffer, n, MSG_DONTWAIT, dst_addr, dst_addrlen);
+        if (s->addrlen != addrlen || memcmp(&addr, &s->addr, addrlen) != 0) {
+            char name[100], port[10];
+            getnameinfo((const struct sockaddr *) &addr, addrlen,
+                        name, sizeof(name),
+                        port, sizeof(port), NI_NUMERICHOST);
+            fprintf(stderr, "Update client-%c address to %s:%s\n", s->id, name, port);
+            s->addrlen = addrlen;
+            memcpy(&s->addr, &addr, addrlen);
+        }
+
+        if (d->addrlen == 0) {
+            fprintf(stderr, "Destination client is unknown.\n");
+            continue;
+        }
+
+        sendto(io_udp.fd, buffer, n, MSG_DONTWAIT, (struct sockaddr *) &d->addr, d->addrlen);
     }
 }
 
@@ -88,15 +114,6 @@ static void udp_start(const char *addr, const char *port) {
         exit(1);
     }
 
-    addr1len = sizeof(addr1);
-    udp_wait_client(fd, (struct sockaddr *) &addr1, &addr1len);
-    do {
-        fprintf(stderr, "Waiting for the second client\n");
-        addr2len = sizeof(addr2);
-        udp_wait_client(fd, (struct sockaddr *) &addr2, &addr2len);
-    } while (addr1len == addr2len && memcmp(&addr2, &addr1, addr1len) == 0);
-
-    fprintf(stderr, "Okay, let's relay data.\n");
     ev_io_init(&io_udp, on_udp_callback, fd, EV_READ);
     ev_io_start(EV_DEFAULT_ &io_udp);
 }

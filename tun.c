@@ -19,12 +19,13 @@
 
 #define PROGNAME "Simple TUN/TAP"
 static ev_io io_tun, io_udp;
-static uint8_t buffer_plaintext[64 * 1024], buffer_ciphertext[64 * 1024 + 16];
+static uint8_t buffer_plaintext[64 * 1024], buffer_ciphertext[1 + 64 * 1024 + 16];
 static mbedtls_gcm_context aes_gcm;
 static mbedtls_entropy_context entropy;
 static mbedtls_ctr_drbg_context ctr_drbg;
 static struct sockaddr_storage peer_addr;
 static socklen_t peer_addrlen = 0;
+static uint8_t relay_client_id = 0;
 
 static void mbedtls_fail(const char *func, int rc) {
     char buf[100];
@@ -111,9 +112,10 @@ static void on_tun_callback(EV_P_ ev_io *w, int revents) {
         return;
     }
     size_t new_len;
-    crypto_encrypt(buffer_ciphertext, &new_len, buffer_plaintext, n);
+    crypto_encrypt(buffer_ciphertext + 1, &new_len, buffer_plaintext, n);
+    buffer_ciphertext[0] = relay_client_id;
 
-    sendto(io_udp.fd, buffer_ciphertext, new_len, MSG_DONTWAIT | MSG_NOSIGNAL,
+    sendto(io_udp.fd, buffer_ciphertext, new_len + 1, MSG_DONTWAIT | MSG_NOSIGNAL,
            (struct sockaddr *) &peer_addr, peer_addrlen);
 }
 
@@ -124,7 +126,7 @@ static void on_udp_callback(EV_P_ ev_io *w, int revents) {
 
     n = recvfrom(io_udp.fd, buffer_ciphertext, sizeof(buffer_ciphertext), MSG_DONTWAIT,
                  (struct sockaddr *) &addr, &addrlen);
-    if (n < 0) {
+    if (n < 1) {
         switch (errno) {
             case EMSGSIZE:
                 fprintf(stderr, "udp: message too large. Decrease your MTU on the tap/tun interface.\n");
@@ -139,7 +141,7 @@ static void on_udp_callback(EV_P_ ev_io *w, int revents) {
         return;
     }
     size_t new_len;
-    int rc = crypto_decrypt(buffer_plaintext, &new_len, buffer_ciphertext, n);
+    int rc = crypto_decrypt(buffer_plaintext, &new_len, buffer_ciphertext + 1, n - 1);
     if (rc != 0) {
         return;
     }
@@ -257,13 +259,15 @@ static void gen_random_key(uint8_t *out, size_t olen) {
 }
 
 static void usage(const char *prog_name) {
-    fprintf(stderr, "Usage: %s [-lu] [-s secret] addr port\n"
+    fprintf(stderr, "Usage: %s [-lu] [-s key] [-R 0|1] addr port\n"
                     "\n"
                     "Options:\n"
                     "   -l   Listen mode. (The default is connect mode)\n"
                     "   -u   TUN device. (The default is TAP device)\n"
                     "   -s secret\n"
                     "        Specify the AES key. (The default is a random key)\n"
+                    "   -R 0|1\n"
+                    "        relay traffic as peer1 or peer2.\n"
                     "\n"
                     "  addr  The local address in listen mode or the remote address in connect mode.\n"
                     "  port  The bind port in listen mode or the remote port in connect mode.\n"
@@ -281,7 +285,7 @@ int main(int argc, char *argv[]) {
     int random_key = 1;
     uint8_t key[16];
 
-    while ((opt = getopt(argc, argv, "lus:")) != -1) {
+    while ((opt = getopt(argc, argv, "lus:R:")) != -1) {
         switch (opt) {
             case 'l':
                 listen_mode = 1;
@@ -292,6 +296,9 @@ int main(int argc, char *argv[]) {
             case 's':
                 kdf_password_to_key(key, sizeof(key), optarg, strlen(optarg));
                 random_key = 0;
+                break;
+            case 'R':
+                relay_client_id = optarg[0];
                 break;
             default: /* '?' */
                 usage(argv[0]);

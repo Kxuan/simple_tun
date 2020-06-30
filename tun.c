@@ -115,7 +115,7 @@ static void on_tun_callback(EV_P_ ev_io *w, int revents) {
     crypto_encrypt(buffer_ciphertext + 1, &new_len, buffer_plaintext, n);
     buffer_ciphertext[0] = relay_client_id;
 
-    sendto(io_udp.fd, buffer_ciphertext, new_len, MSG_DONTWAIT | MSG_NOSIGNAL,
+    sendto(io_udp.fd, buffer_ciphertext, new_len + 1, MSG_DONTWAIT | MSG_NOSIGNAL,
            (struct sockaddr *) &peer_addr, peer_addrlen);
 }
 

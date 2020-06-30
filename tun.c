@@ -126,7 +126,7 @@ static void on_udp_callback(EV_P_ ev_io *w, int revents) {
 
     n = recvfrom(io_udp.fd, buffer_ciphertext, sizeof(buffer_ciphertext), MSG_DONTWAIT,
                  (struct sockaddr *) &addr, &addrlen);
-    if (n < 0) {
+    if (n < 1) {
         switch (errno) {
             case EMSGSIZE:
                 fprintf(stderr, "udp: message too large. Decrease your MTU on the tap/tun interface.\n");

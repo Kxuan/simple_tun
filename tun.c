@@ -18,15 +18,47 @@
 #include <mbedtls/ctr_drbg.h>
 
 #define PROGNAME "Simple TUN/TAP"
+#define PROTOCOL_VERSION 1
+#define MTU 1450
+#define TAG_LEN 16
+#define IV_LEN 12
 static ev_io io_tun, io_udp;
-static uint8_t buffer_plaintext[64 * 1024], buffer_ciphertext[1 + 64 * 1024 + 16];
-static mbedtls_gcm_context aes_gcm;
+
+struct buffer {
+    uint8_t *p;
+    uint8_t data[MTU];
+};
+
+static struct buffer out_buf;
+static ev_idle out_idle;
+static mbedtls_gcm_context encrypt_cipher, decrypt_cipher;
+static uint8_t raw_buf[64 * 1024];
 static mbedtls_entropy_context entropy;
 static mbedtls_ctr_drbg_context ctr_drbg;
 static struct sockaddr_storage peer_addr;
 static socklen_t peer_addrlen = 0;
 static uint8_t relay_client_id = 0;
 
+static void buffer_reset(struct buffer *buf) {
+    buf->p = buf->data;
+}
+
+static void *buffer_push(struct buffer *buf, size_t size) {
+
+    void *p = buf->p;
+    buf->p += size;
+    return p;
+}
+
+static size_t buffer_remains(struct buffer *buf) {
+    return sizeof(buf->data) - (buf->p - buf->data);
+}
+
+static size_t buffer_len(struct buffer *buf) {
+    return buf->p - buf->data;
+}
+
+__attribute__((noreturn))
 static void mbedtls_fail(const char *func, int rc) {
     char buf[100];
     mbedtls_strerror(rc, buf, sizeof(buf));
@@ -43,58 +75,97 @@ static void crypto_init(uint8_t key[16]) {
         mbedtls_fail("mbedtls_ctr_drbg_seed", rc);
     }
 
-    mbedtls_gcm_init(&aes_gcm);
-    if ((rc = mbedtls_gcm_setkey(&aes_gcm, MBEDTLS_CIPHER_ID_AES, key, 128)) != 0) {
+    mbedtls_gcm_init(&encrypt_cipher);
+    mbedtls_gcm_init(&decrypt_cipher);
+    if ((rc = mbedtls_gcm_setkey(&encrypt_cipher, MBEDTLS_CIPHER_ID_AES, key, 128)) != 0) {
+        mbedtls_fail("mbedtls_gcm_setkey", rc);
+    }
+    if ((rc = mbedtls_gcm_setkey(&decrypt_cipher, MBEDTLS_CIPHER_ID_AES, key, 128)) != 0) {
         mbedtls_fail("mbedtls_gcm_setkey", rc);
     }
 }
 
-static void crypto_encrypt(
-        uint8_t *out_buf, size_t *olen,
-        const uint8_t *plaintext, size_t len) {
-    uint8_t *out_iv = out_buf,
-            *out_ciphertext = out_iv + 12,
-            *out_tag = out_ciphertext + len;
-    int rc;
-    if ((rc = mbedtls_ctr_drbg_random(&ctr_drbg, out_iv, 12)) != 0) {
-        mbedtls_fail("mbedtls_ctr_drbg_random", rc);
-    }
-
-    rc = mbedtls_gcm_crypt_and_tag(&aes_gcm, MBEDTLS_GCM_ENCRYPT, len,
-                                   out_iv, 12,
-                                   NULL, 0, plaintext,
-                                   out_ciphertext,
-                                   4, out_tag);
-    if (rc != 0) {
-        mbedtls_fail("mbedtls_gcm_crypt_and_tag", rc);
-    }
-    *olen = 12 + len + 4;
-}
-
 static int crypto_decrypt(
-        uint8_t *out_buf, size_t *olen,
-        const uint8_t *ciphertext, size_t len) {
+    uint8_t *out, size_t *olen,
+    const uint8_t *ciphertext, size_t len) {
 
-    if (len < 12 + 4) {
+    if (len < IV_LEN + TAG_LEN) {
         return -1;
     }
 
-    const uint8_t *in_iv = ciphertext,
-            *in_ciphertext = in_iv + 12,
-            *in_tag = ciphertext + (len - 4);
+    const uint8_t *in_aad = ciphertext,
+        *in_iv = ciphertext + 1,
+        *in_ciphertext = in_iv + IV_LEN,
+        *in_tag = ciphertext + (len - 4);
+
     int rc;
 
-    rc = mbedtls_gcm_auth_decrypt(&aes_gcm,
+    rc = mbedtls_gcm_auth_decrypt(&decrypt_cipher,
                                   in_tag - in_ciphertext,
-                                  in_iv, 12,
-                                  NULL, 0,
-                                  in_tag, 4,
-                                  in_ciphertext, out_buf);
+                                  in_iv, IV_LEN,
+                                  in_aad, 1,
+                                  in_tag, TAG_LEN,
+                                  in_ciphertext, out);
     if (rc != 0) {
         return rc;
     }
     *olen = in_tag - in_ciphertext;
     return rc;
+}
+
+static void out_reset_buffer(struct buffer *buf) {
+    int rc;
+
+    buffer_reset(buf);
+    uint8_t *flags = buffer_push(buf, 1);
+    *flags |= relay_client_id == 0;
+    uint8_t *iv = buffer_push(buf, 12);
+    if ((rc = mbedtls_ctr_drbg_random(&ctr_drbg, iv, 12)) != 0) {
+        mbedtls_fail("mbedtls_ctr_drbg_random", rc);
+    }
+    if ((rc = mbedtls_gcm_starts(&encrypt_cipher, MBEDTLS_ENCRYPT, iv, 12, flags, 1)) != 0) {
+        mbedtls_fail("mbedtls_gcm_starts", rc);
+    }
+}
+
+static void out_flush(struct buffer *buf) {
+    uint8_t *tag = buffer_push(buf, TAG_LEN);
+    int rc;
+    rc = mbedtls_gcm_finish(&encrypt_cipher, tag, TAG_LEN);
+    if (rc != 0) {
+        mbedtls_fail("mbedtls_gcm_finish", rc);
+    }
+
+    sendto(io_udp.fd, buf->data, buffer_len(buf), MSG_DONTWAIT | MSG_NOSIGNAL,
+           (struct sockaddr *) &peer_addr, peer_addrlen);
+
+    out_reset_buffer(buf);
+}
+
+static void out_push_packet(struct buffer *buf, const void *pkt, size_t pkt_len) {
+    if (buffer_remains(buf) < sizeof(uint16_t) + pkt_len + TAG_LEN) {
+        out_flush(buf);
+    }
+
+    uint8_t *len = buffer_push(buf, sizeof(uint16_t));
+    len[0] = (pkt_len >> 8) & 0xff;
+    len[1] = pkt_len & 0xff;
+    void *ct = buffer_push(buf, pkt_len);
+    int rc;
+    if ((rc = mbedtls_gcm_update(&encrypt_cipher, pkt_len, pkt, ct)) != 0) {
+        mbedtls_fail("mbedtls_gcm_update", rc);
+    }
+    ev_idle_start(EV_DEFAULT_ &out_idle);
+}
+
+static void on_out_idle(EV_P_ ev_idle *w, int revents) {
+    ev_idle_stop(EV_A_ w);
+    out_flush(&out_buf);
+}
+
+static void out_init() {
+    out_reset_buffer(&out_buf);
+    ev_idle_init(&out_idle, on_out_idle);
 }
 
 static void on_tun_callback(EV_P_ ev_io *w, int revents) {
@@ -103,7 +174,7 @@ static void on_tun_callback(EV_P_ ev_io *w, int revents) {
     if (peer_addrlen == 0) {
         return;
     }
-    n = read(io_tun.fd, buffer_plaintext, sizeof(buffer_plaintext));
+    n = read(io_tun.fd, raw_buf, sizeof(raw_buf));
     if (n < 0) {
         if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
             perror("tun: read");
@@ -111,12 +182,7 @@ static void on_tun_callback(EV_P_ ev_io *w, int revents) {
         }
         return;
     }
-    size_t new_len;
-    crypto_encrypt(buffer_ciphertext + 1, &new_len, buffer_plaintext, n);
-    buffer_ciphertext[0] = relay_client_id;
-
-    sendto(io_udp.fd, buffer_ciphertext, new_len + 1, MSG_DONTWAIT | MSG_NOSIGNAL,
-           (struct sockaddr *) &peer_addr, peer_addrlen);
+    out_push_packet(&out_buf, raw_buf, n);
 }
 
 static void on_udp_callback(EV_P_ ev_io *w, int revents) {
@@ -124,7 +190,7 @@ static void on_udp_callback(EV_P_ ev_io *w, int revents) {
     struct sockaddr_storage addr;
     socklen_t addrlen = sizeof(&addr);
 
-    n = recvfrom(io_udp.fd, buffer_ciphertext, sizeof(buffer_ciphertext), MSG_DONTWAIT,
+    n = recvfrom(io_udp.fd, raw_buf, sizeof(raw_buf), MSG_DONTWAIT,
                  (struct sockaddr *) &addr, &addrlen);
     if (n < 1) {
         switch (errno) {
@@ -141,7 +207,7 @@ static void on_udp_callback(EV_P_ ev_io *w, int revents) {
         return;
     }
     size_t new_len;
-    int rc = crypto_decrypt(buffer_plaintext, &new_len, buffer_ciphertext + 1, n - 1);
+    int rc = crypto_decrypt(raw_buf, &new_len, raw_buf, n);
     if (rc != 0) {
         return;
     }
@@ -150,7 +216,18 @@ static void on_udp_callback(EV_P_ ev_io *w, int revents) {
         memcpy(&peer_addr, &addr, addrlen);
         fprintf(stderr, "Peer incoming\n");
     }
-    write(io_tun.fd, buffer_plaintext, new_len);
+    uint8_t *p = raw_buf;
+    size_t remains = new_len;
+    while (remains > sizeof(uint16_t)) {
+        uint16_t len = ((uint16_t) p[0] << 8) | p[1];
+        p += 2;
+        remains -= 2;
+
+        if (len > remains) {
+            return;
+        }
+        write(io_tun.fd, p, len);
+    }
 }
 
 static void tun_start(int is_tun) {
@@ -315,6 +392,7 @@ int main(int argc, char *argv[]) {
     addr = argv[optind];
     port = argv[optind + 1];
 
+    out_init();
     tun_start(is_tun);
     udp_start(listen_mode, addr, port);
     ev_run(EV_DEFAULT_ 0);

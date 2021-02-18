@@ -1,3 +1,6 @@
+
+#include "udp.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,14 +21,14 @@
 #include <mbedtls/ctr_drbg.h>
 
 #define PROGNAME "Simple TUN/TAP"
-static ev_io io_tun, io_udp;
+static ev_io io_tun;
 static uint8_t buffer_plaintext[64 * 1024], buffer_ciphertext[1 + 64 * 1024 + 16];
 static mbedtls_gcm_context aes_gcm;
 static mbedtls_entropy_context entropy;
 static mbedtls_ctr_drbg_context ctr_drbg;
-static struct sockaddr_storage peer_addr;
-static socklen_t peer_addrlen = 0;
 static uint8_t relay_client_id = 0;
+
+static struct udp_context udp_sock;
 
 static void mbedtls_fail(const char *func, int rc) {
     char buf[100];
@@ -50,11 +53,11 @@ static void crypto_init(uint8_t key[16]) {
 }
 
 static void crypto_encrypt(
-        uint8_t *out_buf, size_t *olen,
-        const uint8_t *plaintext, size_t len) {
+    uint8_t *out_buf, size_t *olen,
+    const uint8_t *plaintext, size_t len) {
     uint8_t *out_iv = out_buf,
-            *out_ciphertext = out_iv + 12,
-            *out_tag = out_ciphertext + len;
+        *out_ciphertext = out_iv + 12,
+        *out_tag = out_ciphertext + len;
     int rc;
     if ((rc = mbedtls_ctr_drbg_random(&ctr_drbg, out_iv, 12)) != 0) {
         mbedtls_fail("mbedtls_ctr_drbg_random", rc);
@@ -72,16 +75,16 @@ static void crypto_encrypt(
 }
 
 static int crypto_decrypt(
-        uint8_t *out_buf, size_t *olen,
-        const uint8_t *ciphertext, size_t len) {
+    uint8_t *out_buf, size_t *olen,
+    const uint8_t *ciphertext, size_t len) {
 
     if (len < 12 + 4) {
         return -1;
     }
 
     const uint8_t *in_iv = ciphertext,
-            *in_ciphertext = in_iv + 12,
-            *in_tag = ciphertext + (len - 4);
+        *in_ciphertext = in_iv + 12,
+        *in_tag = ciphertext + (len - 4);
     int rc;
 
     rc = mbedtls_gcm_auth_decrypt(&aes_gcm,
@@ -100,7 +103,7 @@ static int crypto_decrypt(
 static void on_tun_callback(EV_P_ ev_io *w, int revents) {
     ssize_t n;
 
-    if (peer_addrlen == 0) {
+    if (udp_sock.peer_addrlen == 0) {
         return;
     }
     n = read(io_tun.fd, buffer_plaintext, sizeof(buffer_plaintext));
@@ -115,44 +118,25 @@ static void on_tun_callback(EV_P_ ev_io *w, int revents) {
     crypto_encrypt(buffer_ciphertext + 1, &new_len, buffer_plaintext, n);
     buffer_ciphertext[0] = relay_client_id;
 
-    sendto(io_udp.fd, buffer_ciphertext, new_len + 1, MSG_DONTWAIT | MSG_NOSIGNAL,
-           (struct sockaddr *) &peer_addr, peer_addrlen);
+    udp_send(&udp_sock, buffer_ciphertext, new_len + 1);
+    sendto(udp_sock.io.fd, buffer_ciphertext, new_len + 1, MSG_DONTWAIT | MSG_NOSIGNAL,
+           (struct sockaddr *) &udp_sock.peer_addr, udp_sock.peer_addrlen);
 }
 
-static void on_udp_callback(EV_P_ ev_io *w, int revents) {
-    ssize_t n;
-    struct sockaddr_storage addr;
-    socklen_t addrlen = sizeof(&addr);
-
-    n = recvfrom(io_udp.fd, buffer_ciphertext, sizeof(buffer_ciphertext), MSG_DONTWAIT,
-                 (struct sockaddr *) &addr, &addrlen);
-    if (n < 1) {
-        switch (errno) {
-            case EMSGSIZE:
-                fprintf(stderr, "udp: message too large. Decrease your MTU on the tap/tun interface.\n");
-                break;
-            case EINTR:
-            case EAGAIN:
-                break;
-            default:
-                perror("udp: recv");
-                exit(1);
-        }
-        return;
-    }
+static void udp_recv_cb(struct udp_context *udp,
+                        uint8_t *msg, size_t len,
+                        struct sockaddr *addr, socklen_t addrlen) {
     size_t new_len;
-    int rc = crypto_decrypt(buffer_plaintext, &new_len, buffer_ciphertext + 1, n - 1);
+    int rc = crypto_decrypt(buffer_plaintext, &new_len, msg + 1, len - 1);
     if (rc != 0) {
         return;
     }
-    if (peer_addrlen == 0) {
-        peer_addrlen = addrlen;
-        memcpy(&peer_addr, &addr, addrlen);
+    if (!udp_peer_is_locked(udp)) {
+        udp_peer_lock(udp, addr, addrlen);
         fprintf(stderr, "Peer incoming\n");
     }
     write(io_tun.fd, buffer_plaintext, new_len);
 }
-
 static void tun_start(int is_tun) {
     struct ifreq ifr;
     int fd, err;
@@ -181,43 +165,40 @@ static void tun_start(int is_tun) {
     ev_io_start(EV_DEFAULT_ &io_tun);
 }
 
-static void udp_start(int listen_mode, const char *addr, const char *port) {
-    int fd;
-    int rc;
+static int resolve_addr_port(struct sockaddr *out_addr, socklen_t *out_addrlen, const char *host, const char *svc) {
     struct addrinfo *ai, req = {};
+    int rc;
 
-    rc = getaddrinfo(addr, port, &req, &ai);
+    rc = getaddrinfo(host, svc, &req, &ai);
     if (rc != 0) {
         fprintf(stderr, "getaddrinfo: ");
         fputs(gai_strerror(rc), stderr);
-        exit(1);
+        return -1;
     }
 
-    fd = socket(ai->ai_family, SOCK_DGRAM | SOCK_NONBLOCK, 0);
-    if (fd < 0) {
-        perror("socket");
-        exit(1);
-    }
-    if (listen_mode) {
-        rc = bind(fd, ai->ai_addr, ai->ai_addrlen);
-        if (rc < 0) {
-            perror(listen_mode ? "bind" : "connect");
-            exit(1);
+    rc = -1;
+    for (struct addrinfo *addr = ai; addr != NULL; addr = addr->ai_next) {
+        if (addr->ai_addrlen > *out_addrlen) {
+            continue;
         }
-    } else {
-        peer_addrlen = ai->ai_addrlen;
-        memcpy(&peer_addr, ai->ai_addr, ai->ai_addrlen);
+        if (addr->ai_family != AF_INET && addr->ai_family != AF_INET6) {
+            continue;
+        }
+
+        memcpy(out_addr, addr->ai_addr, addr->ai_addrlen);
+        *out_addrlen = addr->ai_addrlen;
+        rc = 0;
+        break;
     }
-    ev_io_init(&io_udp, on_udp_callback, fd, EV_READ);
-    ev_io_start(EV_DEFAULT_ &io_udp);
+    freeaddrinfo(ai);
+    return rc;
 }
 
-static void kdf_password_to_key(uint8_t *out, size_t olen, const char *password, size_t pwlen) {
+static void kdf_password_to_key(uint8_t *out, size_t olen, const uint8_t *password, size_t pwlen) {
     int rc;
-    int err;
 
     rc = mbedtls_hkdf(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), NULL, 0,
-                      password, strlen(password),
+                      password, pwlen,
                       PROGNAME, sizeof(PROGNAME),
                       out, olen);
     if (rc != 0) {
@@ -236,19 +217,10 @@ static void gen_random_key(uint8_t *out, size_t olen) {
     int pwlen = olen * 8 / 6 + 1;
     uint8_t password[pwlen];
     static const char password_chars[64] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_@";
-    mbedtls_entropy_context entropy;
-    mbedtls_ctr_drbg_context ctr_drbg;
 
-    mbedtls_entropy_init(&entropy);
-    mbedtls_ctr_drbg_init(&ctr_drbg);
-    if ((rc = mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy, PROGNAME, sizeof(PROGNAME))) != 0) {
-        mbedtls_fail("mbedtls_ctr_drbg_seed", rc);
-    }
     if ((rc = mbedtls_ctr_drbg_random(&ctr_drbg, password, pwlen)) != 0) {
         mbedtls_fail("mbedtls_ctr_drbg_random", rc);
     }
-    mbedtls_ctr_drbg_free(&ctr_drbg);
-    mbedtls_entropy_free(&entropy);
 
     for (size_t i = 0; i < pwlen; ++i) {
         password[i] = password_chars[password[i] % 64];
@@ -279,29 +251,31 @@ static void usage(const char *prog_name) {
 
 int main(int argc, char *argv[]) {
     int opt;
-    int listen_mode = 0;
-    int is_tun = 0;
-    const char *addr, *port;
+    int arg_listen_mode = 0;
+    int arg_is_tun = 0;
+    const char *arg_addr, *arg_port;
     int random_key = 1;
     uint8_t key[16];
 
+    crypto_init(key);
+
     while ((opt = getopt(argc, argv, "lus:R:")) != -1) {
         switch (opt) {
-            case 'l':
-                listen_mode = 1;
-                break;
-            case 'u':
-                is_tun = 1;
-                break;
-            case 's':
-                kdf_password_to_key(key, sizeof(key), optarg, strlen(optarg));
-                random_key = 0;
-                break;
-            case 'R':
-                relay_client_id = optarg[0];
-                break;
-            default: /* '?' */
-                usage(argv[0]);
+        case 'l':
+            arg_listen_mode = 1;
+            break;
+        case 'u':
+            arg_is_tun = 1;
+            break;
+        case 's':
+            kdf_password_to_key(key, sizeof(key), optarg, strlen(optarg));
+            random_key = 0;
+            break;
+        case 'R':
+            relay_client_id = optarg[0];
+            break;
+        default: /* '?' */
+            usage(argv[0]);
         }
     }
     if (optind + 2 != argc) {
@@ -310,13 +284,25 @@ int main(int argc, char *argv[]) {
     if (random_key) {
         gen_random_key(key, sizeof(key));
     }
-    crypto_init(key);
+    arg_addr = argv[optind];
+    arg_port = argv[optind + 1];
 
-    addr = argv[optind];
-    port = argv[optind + 1];
+    struct sockaddr_storage addr;
+    socklen_t addrlen = sizeof(addr);
+    int rc;
 
-    tun_start(is_tun);
-    udp_start(listen_mode, addr, port);
+    rc = resolve_addr_port((struct sockaddr *) &addr, &addrlen, arg_addr, arg_port);
+    if (rc != 0) {
+        exit(1);
+    }
+
+    tun_start(arg_is_tun);
+    udp_init(&udp_sock, arg_listen_mode, (struct sockaddr *) &addr, sizeof(addr), udp_recv_cb);
+    udp_start(&udp_sock);
+
     ev_run(EV_DEFAULT_ 0);
+
+    udp_stop(&udp_sock);
+
     return 0;
 }

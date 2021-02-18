@@ -4,7 +4,7 @@ project(simple_tun C)
 set(CMAKE_C_STANDARD 11)
 add_definitions(-D_GNU_SOURCE)
 
-add_executable(simple_tun tun.c)
+add_executable(simple_tun src/tun.c src/udp.c src/udp.h)
 target_link_libraries(simple_tun PUBLIC ev)
 target_link_libraries(simple_tun PUBLIC mbedcrypto)
 

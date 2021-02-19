@@ -23,9 +23,11 @@
 #include <mbedtls/ctr_drbg.h>
 #include <spawn.h>
 
+#define STR_INDIR(x) #x
+#define STR(x) STR_INDIR(x)
 #define PROGNAME "Simple TUN/TAP"
 #define DEFAULT_PORT 26829
-#define DEFAULT_PORT_STR "26829"
+#define DEFAULT_PORT_STR STR(DEFAULT_PORT)
 
 static ev_io io_tun;
 static uint8_t buffer_plaintext[64 * 1024], buffer_ciphertext[1 + 64 * 1024 + 16];

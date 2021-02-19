@@ -65,7 +65,7 @@ static void mbedtls_fail(const char *func, int rc) {
     exit(1);
 }
 
-static void crypto_init(uint8_t key[16]) {
+static void crypto_init(void) {
     int rc;
 
     mbedtls_entropy_init(&entropy);
@@ -74,10 +74,6 @@ static void crypto_init(uint8_t key[16]) {
         mbedtls_fail("mbedtls_ctr_drbg_seed", rc);
     }
 
-    mbedtls_gcm_init(&aes_gcm);
-    if ((rc = mbedtls_gcm_setkey(&aes_gcm, MBEDTLS_CIPHER_ID_AES, key, 128)) != 0) {
-        mbedtls_fail("mbedtls_gcm_setkey", rc);
-    }
 }
 
 static void crypto_encrypt(
@@ -320,7 +316,7 @@ int main(int argc, char *argv[]) {
     int opt;
     uint8_t key[16];
 
-    crypto_init(key);
+    crypto_init();
 
     while ((opt = getopt(argc, argv, "l:us:R:")) != -1) {
         switch (opt) {
@@ -356,6 +352,11 @@ int main(int argc, char *argv[]) {
         gen_random_key(key, sizeof(key));
     }
     int rc;
+
+    mbedtls_gcm_init(&aes_gcm);
+    if ((rc = mbedtls_gcm_setkey(&aes_gcm, MBEDTLS_CIPHER_ID_AES, key, 128)) != 0) {
+        mbedtls_fail("mbedtls_gcm_setkey", rc);
+    }
 
     udp_init(&udp_sock, udp_recv_cb,
              (struct sockaddr *) &global_options.local_addr,

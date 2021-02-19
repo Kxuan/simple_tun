@@ -15,26 +15,20 @@ typedef void (*udp_recv_fn)(struct udp_context *udp,
 );
 
 struct udp_context {
-    int listen_mode;
-    struct sockaddr_storage local_addr, peer_addr;
-    socklen_t local_addrlen, peer_addrlen;
+    struct sockaddr_storage local_addr;
+    socklen_t local_addrlen;
     ev_io io;
 
     udp_recv_fn recv_cb;
 };
 
 void
-udp_init(struct udp_context *udp, int listen_mode, const struct sockaddr *addr, socklen_t addrlen, udp_recv_fn recv_cb);
+udp_init(struct udp_context *udp, udp_recv_fn recv_cb, const struct sockaddr *local_addr, socklen_t local_addrlen);
 
 void udp_start(struct udp_context *udp);
 
 void udp_stop(struct udp_context *udp);
 
-void udp_peer_lock(struct udp_context *udp, const struct sockaddr *addr, socklen_t addrlen);
-
-static inline int udp_peer_is_locked(struct udp_context *udp) {
-    return udp->peer_addrlen == 0;
-}
 
 /**
  * Send a udp message
@@ -43,6 +37,8 @@ static inline int udp_peer_is_locked(struct udp_context *udp) {
  * @param len
  * @return
  */
-ssize_t udp_send(struct udp_context *udp, const uint8_t *msg, socklen_t len);
+ssize_t udp_sendto(struct udp_context *udp,
+                   const uint8_t *msg, socklen_t len,
+                   const struct sockaddr *addr, socklen_t addrlen);
 
 #endif //SIMPLE_TUN_UDP_H

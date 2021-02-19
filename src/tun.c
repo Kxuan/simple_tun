@@ -1,5 +1,6 @@
 
 #include "udp.h"
+#include "resolver.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,6 +22,9 @@
 #include <mbedtls/ctr_drbg.h>
 
 #define PROGNAME "Simple TUN/TAP"
+#define DEFAULT_PORT 26829
+#define DEFAULT_PORT_STR "26829"
+
 static ev_io io_tun;
 static uint8_t buffer_plaintext[64 * 1024], buffer_ciphertext[1 + 64 * 1024 + 16];
 static mbedtls_gcm_context aes_gcm;
@@ -28,7 +32,31 @@ static mbedtls_entropy_context entropy;
 static mbedtls_ctr_drbg_context ctr_drbg;
 static uint8_t relay_client_id = 0;
 
+static struct sockaddr_storage peer_addr;
+static socklen_t peer_addrlen = 0;
+static enum status {
+    STATUS_INIT,
+    STATUS_FIRST_RESOLVING,
+    STATUS_RUNNING,
+} status = STATUS_INIT;
+
+static struct program_options {
+    int arg_is_tun;
+    struct sockaddr_storage local_addr;
+    socklen_t local_addrlen;
+    const char *remote_addr, *remote_port;
+    int random_key;
+} global_options = {
+    .arg_is_tun = 0,
+    .local_addr = {.ss_family = AF_INET6},
+    .local_addrlen = 0,
+    .remote_addr = NULL,
+    .remote_port = DEFAULT_PORT_STR,
+    .random_key = 1
+};
+
 static struct udp_context udp_sock;
+static struct resolver_context resolver;
 
 static void mbedtls_fail(const char *func, int rc) {
     char buf[100];
@@ -103,7 +131,7 @@ static int crypto_decrypt(
 static void on_tun_callback(EV_P_ ev_io *w, int revents) {
     ssize_t n;
 
-    if (udp_sock.peer_addrlen == 0) {
+    if (peer_addrlen == 0) {
         return;
     }
     n = read(io_tun.fd, buffer_plaintext, sizeof(buffer_plaintext));
@@ -118,9 +146,8 @@ static void on_tun_callback(EV_P_ ev_io *w, int revents) {
     crypto_encrypt(buffer_ciphertext + 1, &new_len, buffer_plaintext, n);
     buffer_ciphertext[0] = relay_client_id;
 
-    udp_send(&udp_sock, buffer_ciphertext, new_len + 1);
-    sendto(udp_sock.io.fd, buffer_ciphertext, new_len + 1, MSG_DONTWAIT | MSG_NOSIGNAL,
-           (struct sockaddr *) &udp_sock.peer_addr, udp_sock.peer_addrlen);
+    udp_sendto(&udp_sock, buffer_ciphertext, new_len + 1,
+               (struct sockaddr *) &peer_addr, peer_addrlen);
 }
 
 static void udp_recv_cb(struct udp_context *udp,
@@ -131,8 +158,9 @@ static void udp_recv_cb(struct udp_context *udp,
     if (rc != 0) {
         return;
     }
-    if (!udp_peer_is_locked(udp)) {
-        udp_peer_lock(udp, addr, addrlen);
+    if (peer_addrlen == 0) {
+        memcpy(&peer_addr, addr, addrlen);
+        peer_addrlen = addrlen;
         fprintf(stderr, "Peer incoming\n");
     }
     write(io_tun.fd, buffer_plaintext, new_len);
@@ -165,33 +193,31 @@ static void tun_start(int is_tun) {
     ev_io_start(EV_DEFAULT_ &io_tun);
 }
 
-static int resolve_addr_port(struct sockaddr *out_addr, socklen_t *out_addrlen, const char *host, const char *svc) {
-    struct addrinfo *ai, req = {};
-    int rc;
+static void resolve_address_changed_cb(struct resolver_context *r,
+                                       const struct sockaddr *addr, socklen_t addrlen) {
+    peer_addrlen = addrlen;
+    memcpy(&peer_addr, addr, addrlen);
 
-    rc = getaddrinfo(host, svc, &req, &ai);
-    if (rc != 0) {
-        fprintf(stderr, "getaddrinfo: ");
-        fputs(gai_strerror(rc), stderr);
-        return -1;
-    }
+    char host[128];
+    char svc[32];
 
-    rc = -1;
-    for (struct addrinfo *addr = ai; addr != NULL; addr = addr->ai_next) {
-        if (addr->ai_addrlen > *out_addrlen) {
-            continue;
-        }
-        if (addr->ai_family != AF_INET && addr->ai_family != AF_INET6) {
-            continue;
-        }
+    getnameinfo(addr, addrlen,
+                host, sizeof(host),
+                svc, sizeof(svc),
+                NI_NUMERICHOST | NI_NUMERICSERV);
 
-        memcpy(out_addr, addr->ai_addr, addr->ai_addrlen);
-        *out_addrlen = addr->ai_addrlen;
-        rc = 0;
+    switch (status) {
+    case STATUS_FIRST_RESOLVING:
+        fprintf(stderr, "tun: remote address: %s:%s\n", host, svc);
+        status = STATUS_RUNNING;
+        udp_start(&udp_sock);
         break;
+    case STATUS_RUNNING:
+        fprintf(stderr, "tun: remote address updated: %s:%s\n", host, svc);
+        break;
+    default:
+        abort();
     }
-    freeaddrinfo(ai);
-    return rc;
 }
 
 static void kdf_password_to_key(uint8_t *out, size_t olen, const uint8_t *password, size_t pwlen) {
@@ -249,60 +275,110 @@ static void usage(const char *prog_name) {
     exit(EXIT_FAILURE);
 }
 
+static int parse_option_local_address(char *local_address) {
+    struct addrinfo hints = {
+        .ai_socktype = SOCK_DGRAM,
+        .ai_protocol = IPPROTO_UDP,
+        .ai_flags = AI_NUMERICHOST | AI_NUMERICSERV
+    };
+    struct addrinfo *ai;
+    int rc;
+
+    if (local_address[0] == '[') { // IPv6 address
+        hints.ai_family = AF_INET6;
+        char *rbracket = strchr(local_address, ']');
+        const char *port = DEFAULT_PORT_STR;
+
+        if (rbracket[1] == ':') {
+            port = rbracket + 2;
+        }
+
+        *rbracket = 0;
+        rc = getaddrinfo(local_address + 1, port, &hints, &ai);
+    } else { // IPv4 Address
+        hints.ai_family = AF_INET;
+        const char *colon = strchr(local_address, ':');
+        const char *port = DEFAULT_PORT_STR;
+        if (colon != NULL) {
+            port = colon + 1;
+        }
+        rc = getaddrinfo(local_address, port, &hints, &ai);
+    }
+
+    if (rc == 0) {
+        fprintf(stderr, "failed to resolve local address: %s\n", gai_strerror(rc));
+        return -1;
+    }
+    global_options.local_addrlen = ai->ai_addrlen;
+    memcpy(&global_options.local_addr, ai->ai_addr, ai->ai_addrlen);
+
+    freeaddrinfo(ai);
+    return 0;
+}
+
 int main(int argc, char *argv[]) {
     int opt;
-    int arg_listen_mode = 0;
-    int arg_is_tun = 0;
-    const char *arg_addr, *arg_port;
-    int random_key = 1;
     uint8_t key[16];
 
     crypto_init(key);
 
-    while ((opt = getopt(argc, argv, "lus:R:")) != -1) {
+    while ((opt = getopt(argc, argv, "l:us:R:")) != -1) {
         switch (opt) {
         case 'l':
-            arg_listen_mode = 1;
+            if (parse_option_local_address(optarg) != 0) {
+                usage(argv[0]);
+                return 1;
+            }
             break;
         case 'u':
-            arg_is_tun = 1;
+            global_options.arg_is_tun = 1;
             break;
         case 's':
             kdf_password_to_key(key, sizeof(key), optarg, strlen(optarg));
-            random_key = 0;
+            global_options.random_key = 0;
             break;
         case 'R':
             relay_client_id = optarg[0];
             break;
         default: /* '?' */
             usage(argv[0]);
+            return 1;
         }
     }
-    if (optind + 2 != argc) {
-        usage(argv[0]);
+    if (optind + 1 <= argc) {
+        global_options.remote_addr = argv[optind];
     }
-    if (random_key) {
+    if (optind + 2 <= argc) {
+        global_options.remote_port = argv[optind + 1];
+    }
+
+    if (global_options.random_key) {
         gen_random_key(key, sizeof(key));
     }
-    arg_addr = argv[optind];
-    arg_port = argv[optind + 1];
-
-    struct sockaddr_storage addr;
-    socklen_t addrlen = sizeof(addr);
     int rc;
 
-    rc = resolve_addr_port((struct sockaddr *) &addr, &addrlen, arg_addr, arg_port);
-    if (rc != 0) {
-        exit(1);
-    }
+    udp_init(&udp_sock, udp_recv_cb,
+             (struct sockaddr *) &global_options.local_addr,
+             global_options.local_addrlen);
 
-    tun_start(arg_is_tun);
-    udp_init(&udp_sock, arg_listen_mode, (struct sockaddr *) &addr, sizeof(addr), udp_recv_cb);
-    udp_start(&udp_sock);
+    if (global_options.remote_addr) {
+        resolver_init(&resolver, resolve_address_changed_cb,
+                      SOCK_DGRAM,
+                      global_options.remote_addr,
+                      global_options.remote_port);
+        status = STATUS_FIRST_RESOLVING;
+        rc = resolver_start(&resolver);
+        if (rc != 0) {
+            fprintf(stderr, "Unable to initialize resolver\n");
+            exit(1);
+        }
+    } else {
+        status = STATUS_RUNNING;
+        udp_start(&udp_sock);
+    }
+    tun_start(global_options.arg_is_tun);
 
     ev_run(EV_DEFAULT_ 0);
-
-    udp_stop(&udp_sock);
 
     return 0;
 }

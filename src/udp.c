@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 
 #include "udp.h"
-
+#include <netinet/in.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,7 +9,7 @@
 #include <unistd.h>
 #include <ev.h>
 
-static uint8_t buffer_plaintext[64 * 1024], buffer_ciphertext[1 + 64 * 1024 + 16];
+static uint8_t buffer_ciphertext[1 + 64 * 1024 + 16];
 
 static void on_udp_callback(EV_P_ ev_io *w, int revents) {
     ssize_t n;
@@ -36,23 +36,19 @@ static void on_udp_callback(EV_P_ ev_io *w, int revents) {
     udp->recv_cb(udp, buffer_ciphertext, n, (struct sockaddr *) &addr, addrlen);
 }
 
-void udp_peer_lock(struct udp_context *udp, const struct sockaddr *addr, socklen_t addrlen) {
-    udp->peer_addrlen = addrlen;
-    memcpy(&udp->peer_addr, &addr, addrlen);
-}
-
-void udp_init(struct udp_context *udp, int listen_mode, const struct sockaddr *addr, socklen_t addrlen,
-              udp_recv_fn recv_cb) {
-    udp->listen_mode = listen_mode;
-    if (udp->listen_mode) {
-        memcpy(&udp->local_addr, addr, addrlen);
-        udp->local_addrlen = addrlen;
+void udp_init(struct udp_context *udp, udp_recv_fn recv_cb,
+              const struct sockaddr *local_addr, socklen_t local_addrlen) {
+    if (local_addrlen == 0) {
+        struct sockaddr_in6 *addr = (struct sockaddr_in6 *) &udp->local_addr;
+        addr->sin6_port = 0;
+        addr->sin6_family = AF_INET6;
+        addr->sin6_addr = (struct in6_addr) IN6ADDR_ANY_INIT;
+        udp->local_addrlen = sizeof(*addr);
     } else {
-        udp->local_addrlen = 0;
-        memcpy(&udp->peer_addr, addr, addrlen);
-        udp->peer_addrlen = addrlen;
+        memcpy(&udp->local_addr, local_addr, local_addrlen);
+        udp->local_addrlen = local_addrlen;
     }
-    udp->peer_addrlen = 0;
+
     ev_io_init(&udp->io, on_udp_callback, -1, EV_READ);
     udp->io.data = udp;
     udp->recv_cb = recv_cb;
@@ -64,16 +60,16 @@ void udp_start(struct udp_context *udp) {
 
     fd = socket(udp->local_addr.ss_family, SOCK_DGRAM | SOCK_NONBLOCK, 0);
     if (fd < 0) {
-        perror("socket");
+        perror("udp: socket");
         exit(1);
     }
-    if (udp->listen_mode) {
-        rc = bind(fd, (struct sockaddr *) &udp->local_addr, udp->local_addrlen);
-        if (rc < 0) {
-            perror("bind");
-            exit(1);
-        }
+
+    rc = bind(fd, (struct sockaddr *) &udp->local_addr, udp->local_addrlen);
+    if (rc < 0) {
+        perror("udp: bind");
+        exit(1);
     }
+    ev_io_set(&udp->io, fd, EV_READ);
     ev_io_start(EV_DEFAULT_ &udp->io);
 }
 
@@ -83,9 +79,11 @@ void udp_stop(struct udp_context *udp) {
     udp->io.fd = -1;
 }
 
-ssize_t udp_send(struct udp_context *udp, const uint8_t *msg, socklen_t len) {
+ssize_t udp_sendto(struct udp_context *udp,
+                   const uint8_t *msg, socklen_t len,
+                   const struct sockaddr *addr, socklen_t addrlen) {
     return sendto(udp->io.fd, msg, len, MSG_DONTWAIT | MSG_NOSIGNAL,
-                  (struct sockaddr *) &udp->peer_addr, udp->peer_addrlen);
+                  addr, addrlen);
 
 }
 

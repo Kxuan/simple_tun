@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <getopt.h>
 #include <unistd.h>
 #include <sys/fcntl.h>
 #include <sys/ioctl.h>
@@ -20,6 +21,7 @@
 #include <mbedtls/error.h>
 #include <mbedtls/entropy.h>
 #include <mbedtls/ctr_drbg.h>
+#include <spawn.h>
 
 #define PROGNAME "Simple TUN/TAP"
 #define DEFAULT_PORT 26829
@@ -34,6 +36,7 @@ static uint8_t relay_client_id = 0;
 
 static struct sockaddr_storage peer_addr;
 static socklen_t peer_addrlen = 0;
+static ev_child child;
 static enum status {
     STATUS_INIT,
     STATUS_FIRST_RESOLVING,
@@ -46,13 +49,16 @@ static struct program_options {
     socklen_t local_addrlen;
     const char *remote_addr, *remote_port;
     int random_key;
+
+    char *hook_remote_changed;
 } global_options = {
     .arg_is_tun = 0,
     .local_addr = {.ss_family = AF_INET6},
     .local_addrlen = 0,
     .remote_addr = NULL,
     .remote_port = DEFAULT_PORT_STR,
-    .random_key = 1
+    .random_key = 1,
+    .hook_remote_changed = NULL,
 };
 
 static struct udp_context udp_sock;
@@ -146,6 +152,16 @@ static void on_tun_callback(EV_P_ ev_io *w, int revents) {
                (struct sockaddr *) &peer_addr, peer_addrlen);
 }
 
+static void child_exit_cb(EV_P_ struct ev_child *w, int revents) {
+    if (WIFEXITED(w->rstatus)) {
+        fprintf(stderr, "tun: child(%d) exited with code: %d\n", w->rpid, WEXITSTATUS(w->rstatus));
+    } else if (WIFSIGNALED(w->rstatus)) {
+        fprintf(stderr, "tun: child(%d) killed by signal: %d\n", w->rpid, WTERMSIG(w->rstatus));
+    } else {
+        fprintf(stderr, "tun: child(%d) signaled with status: 0x%08x\n", w->rpid, w->rstatus);
+    }
+}
+
 static void udp_recv_cb(struct udp_context *udp,
                         uint8_t *msg, size_t len,
                         struct sockaddr *addr, socklen_t addrlen) {
@@ -214,6 +230,23 @@ static void resolve_address_changed_cb(struct resolver_context *r,
     default:
         abort();
     }
+
+    if (global_options.hook_remote_changed) {
+        pid_t pid;
+        char *const argv[] = {
+            global_options.hook_remote_changed,
+            host, svc,
+            NULL
+        };
+        int rc;
+        rc = posix_spawnp(&pid, global_options.hook_remote_changed,
+                          NULL, NULL, argv, NULL);
+        if (rc != 0) {
+            fprintf(stderr, "tun: failed to spawn remote-changed hook: %s(%d)\n", strerror(errno), errno);
+        } else {
+            fprintf(stderr, "tun: remote-changed hook executed with pid: %d\n", pid);
+        }
+    }
 }
 
 static void kdf_password_to_key(uint8_t *out, size_t olen, const uint8_t *password, size_t pwlen) {
@@ -253,7 +286,7 @@ static void gen_random_key(uint8_t *out, size_t olen) {
 }
 
 static void usage(const char *prog_name) {
-    fprintf(stderr, "Usage: %s [-lu] [-s key] [-R 0|1] addr port\n"
+    fprintf(stderr, "Usage: %s [options] addr port\n"
                     "\n"
                     "Options:\n"
                     "   -l   Listen mode. (The default is connect mode)\n"
@@ -262,6 +295,10 @@ static void usage(const char *prog_name) {
                     "        Specify the AES key. (The default is a random key)\n"
                     "   -R 0|1\n"
                     "        relay traffic as peer1 or peer2.\n"
+                    "   --hook-remote-changed <executable>\n"
+                    "        execute <executable> when remote address is changed.\n"
+                    "        Two arguments will be passing to the <executable>, the first is new ip\n"
+                    "        address, the second is new port.\n"
                     "\n"
                     "  addr  The local address in listen mode or the remote address in connect mode.\n"
                     "  port  The bind port in listen mode or the remote port in connect mode.\n"
@@ -312,14 +349,24 @@ static int parse_option_local_address(char *local_address) {
     return 0;
 }
 
+static struct option long_options[] =
+    {
+        /* These options set a flag. */
+        {"hook-remote-changed", required_argument, 0, 1},
+        {0, 0,                                     0, 0}
+    };
 int main(int argc, char *argv[]) {
     int opt;
     uint8_t key[16];
+    int long_idx;
 
     crypto_init();
 
-    while ((opt = getopt(argc, argv, "l:us:R:")) != -1) {
+    while ((opt = getopt_long(argc, argv, "l:us:R:", long_options, &long_idx)) != -1) {
         switch (opt) {
+        case 1:
+            global_options.hook_remote_changed = optarg;
+            break;
         case 'l':
             if (parse_option_local_address(optarg) != 0) {
                 usage(argv[0]);
@@ -357,7 +404,8 @@ int main(int argc, char *argv[]) {
     if ((rc = mbedtls_gcm_setkey(&aes_gcm, MBEDTLS_CIPHER_ID_AES, key, 128)) != 0) {
         mbedtls_fail("mbedtls_gcm_setkey", rc);
     }
-
+    ev_child_init(&child, child_exit_cb, 0, 0);
+    ev_child_start(EV_DEFAULT_ &child);
     udp_init(&udp_sock, udp_recv_cb,
              (struct sockaddr *) &global_options.local_addr,
              global_options.local_addrlen);

@@ -82,12 +82,12 @@ void name_resolved_cb(void *arg, int status, int timeouts, struct ares_addrinfo 
     query_stop(r);
 
     if (status != ARES_SUCCESS) {
-        fprintf(stderr, "resolver: failed to resolve name, retry in %d seconds. (status=%d)", retry_timeout, status);
+        fprintf(stderr, "resolver: failed to resolve name, retry in %d seconds. (status=%d)\n", retry_timeout, status);
         goto out_retry;
     }
 
     if (!res || !res->nodes) {
-        fprintf(stderr, "resolver: empty result, retry in %d seconds.", retry_timeout);
+        fprintf(stderr, "resolver: empty result, retry in %d seconds.\n", retry_timeout);
         goto out_retry;
     }
 

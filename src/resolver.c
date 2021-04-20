@@ -149,6 +149,9 @@ static void timer_cb(EV_P_ ev_timer *w, int revents) {
     }
     case RESOLVER_QUERY: {
         ares_process(r->ares, NULL, NULL);
+        if (r->status == RESOLVER_QUERY) {
+            update_ares_watchers(r);
+        }
         break;
     }
     }

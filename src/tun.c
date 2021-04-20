@@ -7,7 +7,7 @@
 #include <string.h>
 #include <getopt.h>
 #include <unistd.h>
-#include <sys/fcntl.h>
+#include <fcntl.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <linux/if.h>
@@ -66,6 +66,7 @@ static struct program_options {
 static struct udp_context udp_sock;
 static struct resolver_context resolver;
 
+__attribute__((noreturn))
 static void mbedtls_fail(const char *func, int rc) {
     char buf[100];
     mbedtls_strerror(rc, buf, sizeof(buf));
